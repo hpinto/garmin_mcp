@@ -1,24 +1,3 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
 .env
-.venv/
-*.log
-.DS_Store
-.claude.md
-.mcp.json
-docs/*
-.gitignore
-playground/*
-scratch/*
-tests/fixtures/captured/*
-!tests/fixtures/captured/poc_walk_run.json
+venv/
