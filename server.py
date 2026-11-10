@@ -78,7 +78,7 @@ init_db()
 # Autenticación automática: Intercambio de Personal API Key por Bearer Token
 # --------------------------------------------------------------------------
 async def get_valid_garmin_token(personal_api_key: str) -> str | None:
-    """Intercambia la Personal API Key (GCDC_...) por un OAuth2 Access Token válido."""
+    """Intercambia la Personal API Key (GCDC_...) por el JWT Bearer Token."""
     headers = {
         "Authorization": f"ApiKey {personal_api_key}",
         "Accept": "application/json"
@@ -87,11 +87,11 @@ async def get_valid_garmin_token(personal_api_key: str) -> str | None:
         try:
             response = await client.post(TOKEN_URL, headers=headers)
             response.raise_for_status()
-            data = response.json()
-            return data.get("access_token")
-        except Exception:
+            # Garmin devuelve el JWT directamente como texto plano
+            token = response.text.strip()
+            return token if token else None
+        except Exception as e:
             return None
-
 
 # --------------------------------------------------------------------------
 # Servidor MCP y Definición de Herramientas
