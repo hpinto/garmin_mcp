@@ -1,9 +1,9 @@
 """
-Garmin MCP Multi-Tenant Gateway (Streamable HTTP)
+Garmin MCP Multi-Tenant Gateway con Intercambio Automático de Token (Streamable HTTP)
 
 - Cada usuario tiene su URL: https://www.enduralab.org/garmin_mcp/<token>/mcp
 - Modo stateless: sin sesiones en memoria, un solo Server para todos.
-- El token de la URL se resuelve a la Garmin key del usuario y se pasa mediante un ContextVar.
+- La Personal API Key se intercambia automáticamente por un Bearer Token activo en cada llamada.
 """
 import asyncio
 import contextvars
@@ -33,12 +33,13 @@ TOKEN_PATH_RE = re.compile(
     r"^/garmin_mcp/([0-9a-fA-F-]{36})/(?:mcp|sse)/?$"
 )
 
-# Garmin key del usuario de la petición en curso
+# Llave personal de Garmin del usuario de la petición en curso
 garmin_key_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "garmin_key", default=None
 )
 
 GARMIN_API_BASE = "https://personal.connectapi.garmin.com"
+TOKEN_URL = f"{GARMIN_API_BASE}/personalapitoken-service/personal-api/personal-api-key/token"
 
 
 # --------------------------------------------------------------------------
@@ -74,7 +75,26 @@ init_db()
 
 
 # --------------------------------------------------------------------------
-# Servidor MCP y Definición de Herramientas (Pasarela Completa)
+# Autenticación automática: Intercambio de Personal API Key por Bearer Token
+# --------------------------------------------------------------------------
+async def get_valid_garmin_token(personal_api_key: str) -> str | None:
+    """Intercambia la Personal API Key (GCDC_...) por un OAuth2 Access Token válido."""
+    headers = {
+        "Authorization": f"ApiKey {personal_api_key}",
+        "Accept": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            response = await client.post(TOKEN_URL, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("access_token")
+        except Exception:
+            return None
+
+
+# --------------------------------------------------------------------------
+# Servidor MCP y Definición de Herramientas
 # --------------------------------------------------------------------------
 mcp_server = Server("garmin-mcp")
 
@@ -82,10 +102,9 @@ mcp_server = Server("garmin-mcp")
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        # --- ACTIVIDADES ---
         Tool(
             name="get_activity_summary",
-            description="Obtiene el resumen detallado (SummaryDTO) de una actividad específica[cite: 4, 9].",
+            description="Obtiene el resumen detallado (SummaryDTO) de una actividad específica.",
             inputSchema={
                 "type": "object",
                 "properties": {"activity_id": {"type": "string"}},
@@ -104,10 +123,9 @@ async def list_tools() -> list[Tool]:
                 "required": ["start_date", "end_date"],
             },
         ),
-        # --- SALUD Y BIENESTAR ---
         Tool(
             name="get_garmin_health_summary",
-            description="Obtiene el resumen diario de métricas de salud (Dailies)[cite: 55].",
+            description="Obtiene el resumen diario de métricas de salud (Dailies).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -121,7 +139,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_sleep_summary",
-            description="Obtiene los datos detallados de sueño (DailySleepDTO)[cite: 50, 51].",
+            description="Obtiene los datos detallados de sueño (DailySleepDTO).",
             inputSchema={
                 "type": "object",
                 "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
@@ -130,7 +148,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_hrv_summary",
-            description="Obtiene el resumen de Variabilidad de la Frecuencia Cardíaca (HRV) nocturna[cite: 42].",
+            description="Obtiene el resumen de Variabilidad de la Frecuencia Cardíaca (HRV) nocturna.",
             inputSchema={
                 "type": "object",
                 "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
@@ -139,17 +157,16 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_body_battery",
-            description="Obtiene las métricas de carga y drenaje de Body Battery[cite: 61].",
+            description="Obtiene las métricas de carga y drenaje de Body Battery.",
             inputSchema={
                 "type": "object",
                 "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
                 "required": ["calendar_date"],
             },
         ),
-        # --- PERFIL Y CONFIGURACIÓN ---
         Tool(
             name="get_user_profile",
-            description="Obtiene las configuraciones y perfil general del usuario (UserSettingsDTO)[cite: 53].",
+            description="Obtiene las configuraciones y perfil general del usuario (UserSettingsDTO).",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
@@ -157,11 +174,16 @@ async def list_tools() -> list[Tool]:
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    garmin_key = garmin_key_ctx.get()
-    if not garmin_key:
+    personal_api_key = garmin_key_ctx.get()
+    if not personal_api_key:
         return [TextContent(type="text", text='{"error": "Usuario no identificado"}')]
 
-    headers = {"Authorization": f"Bearer {garmin_key}", "Accept": "application/json"}
+    # 1. Obtener automáticamente el Bearer token válido usando la API Key del usuario
+    access_token = await get_valid_garmin_token(personal_api_key)
+    if not access_token:
+        return [TextContent(type="text", text='{"error": "No se pudo autenticar con Garmin. Verifica tu Personal API Key."}')]
+
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     
     endpoint_map = {
         "get_activity_summary": f"/wellness-api/rest/activities/{arguments.get('activity_id')}",
@@ -178,7 +200,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     url = f"{GARMIN_API_BASE}{endpoint_map[name]}"
     
-    # Mapeo de parámetros específicos según la herramienta
     params = {}
     if name == "list_activities":
         params = {"startDate": arguments.get("start_date"), "endDate": arguments.get("end_date")}
@@ -239,7 +260,7 @@ async def landing_page():
             <form action="/garmin_ui/register" method="post">
                 <input type="text" name="name" placeholder="Nombre completo" required>
                 <input type="email" name="email" placeholder="Correo electrónico" required>
-                <input type="password" name="garmin_key" placeholder="Garmin Personal API Key" required>
+                <input type="password" name="garmin_key" placeholder="Garmin Personal API Key (GCDC_...)" required>
                 <button type="submit">Generar URL de Conexión</button>
             </form>
         </div>
