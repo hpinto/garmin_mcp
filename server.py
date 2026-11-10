@@ -1,14 +1,9 @@
 """
 Garmin MCP Multi-Tenant Gateway (Streamable HTTP)
 
-- Cada usuario tiene su URL:  https://www.enduralab.org/garmin_mcp/<token>/mcp
-  (la URL antigua terminada en /sse sigue funcionando como alias, pero ahora
-   habla Streamable HTTP, que es lo que Claude intenta primero con un POST)
-- Modo stateless: no hay sesiones en memoria, un solo Server para todos.
-- El token de la URL se resuelve a la Garmin key del usuario y se pasa a las
-  herramientas mediante un ContextVar.
-
-Requisitos:  pip install -U mcp fastapi uvicorn httpx python-multipart
+- Cada usuario tiene su URL: https://www.enduralab.org/garmin_mcp/<token>/mcp
+- Modo stateless: sin sesiones en memoria, un solo Server para todos.
+- El token de la URL se resuelve a la Garmin key del usuario y se pasa mediante un ContextVar.
 """
 import asyncio
 import contextvars
@@ -43,6 +38,8 @@ garmin_key_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "garmin_key", default=None
 )
 
+GARMIN_API_BASE = "https://personal.connectapi.garmin.com"
+
 
 # --------------------------------------------------------------------------
 # Base de datos
@@ -52,9 +49,9 @@ def init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                mcp_token  TEXT PRIMARY KEY,
-                name       TEXT,
-                email      TEXT,
+                mcp_token TEXT PRIMARY KEY,
+                name TEXT,
+                email TEXT,
                 garmin_key TEXT
             )
             """
@@ -70,7 +67,6 @@ def _lookup_key(token: str) -> str | None:
 
 
 async def verify_token_in_db(token: str) -> str | None:
-    # sqlite es bloqueante: se ejecuta en un hilo para no frenar el event loop
     return await asyncio.to_thread(_lookup_key, token)
 
 
@@ -78,7 +74,7 @@ init_db()
 
 
 # --------------------------------------------------------------------------
-# Servidor MCP (uno solo, compartido por todos los usuarios)
+# Servidor MCP y Definición de Herramientas (Pasarela Completa)
 # --------------------------------------------------------------------------
 mcp_server = Server("garmin-mcp")
 
@@ -86,23 +82,76 @@ mcp_server = Server("garmin-mcp")
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        # --- ACTIVIDADES ---
+        Tool(
+            name="get_activity_summary",
+            description="Obtiene el resumen detallado (SummaryDTO) de una actividad específica[cite: 4, 9].",
+            inputSchema={
+                "type": "object",
+                "properties": {"activity_id": {"type": "string"}},
+                "required": ["activity_id"],
+            },
+        ),
+        Tool(
+            name="list_activities",
+            description="Lista las actividades físicas del usuario en un rango de fechas (YYYY-MM-DD).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string"},
+                    "end_date": {"type": "string"},
+                },
+                "required": ["start_date", "end_date"],
+            },
+        ),
+        # --- SALUD Y BIENESTAR ---
         Tool(
             name="get_garmin_health_summary",
-            description=(
-                "Obtiene el resumen diario de métricas de salud (Dailies) "
-                "desde la API Personal de Garmin Connect."
-            ),
+            description="Obtiene el resumen diario de métricas de salud (Dailies)[cite: 55].",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "date_start_epoch": {
                         "type": "integer",
-                        "description": "Timestamp de inicio en formato epoch (segundos).",
+                        "description": "Timestamp de inicio en epoch (segundos).",
                     }
                 },
                 "required": ["date_start_epoch"],
             },
-        )
+        ),
+        Tool(
+            name="get_sleep_summary",
+            description="Obtiene los datos detallados de sueño (DailySleepDTO)[cite: 50, 51].",
+            inputSchema={
+                "type": "object",
+                "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
+                "required": ["calendar_date"],
+            },
+        ),
+        Tool(
+            name="get_hrv_summary",
+            description="Obtiene el resumen de Variabilidad de la Frecuencia Cardíaca (HRV) nocturna[cite: 42].",
+            inputSchema={
+                "type": "object",
+                "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
+                "required": ["calendar_date"],
+            },
+        ),
+        Tool(
+            name="get_body_battery",
+            description="Obtiene las métricas de carga y drenaje de Body Battery[cite: 61].",
+            inputSchema={
+                "type": "object",
+                "properties": {"calendar_date": {"type": "string", "description": "Formato YYYY-MM-DD"}},
+                "required": ["calendar_date"],
+            },
+        ),
+        # --- PERFIL Y CONFIGURACIÓN ---
+        Tool(
+            name="get_user_profile",
+            description="Obtiene las configuraciones y perfil general del usuario (UserSettingsDTO)[cite: 53].",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -112,17 +161,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not garmin_key:
         return [TextContent(type="text", text='{"error": "Usuario no identificado"}')]
 
-    if name != "get_garmin_health_summary":
+    headers = {"Authorization": f"Bearer {garmin_key}", "Accept": "application/json"}
+    
+    endpoint_map = {
+        "get_activity_summary": f"/wellness-api/rest/activities/{arguments.get('activity_id')}",
+        "list_activities": "/wellness-api/rest/activities",
+        "get_garmin_health_summary": "/wellness-api/rest/dailies",
+        "get_sleep_summary": f"/wellness-api/rest/sleeps/{arguments.get('calendar_date')}",
+        "get_hrv_summary": f"/wellness-api/rest/hrv/{arguments.get('calendar_date')}",
+        "get_body_battery": f"/wellness-api/rest/bodyBattery/{arguments.get('calendar_date')}",
+        "get_user_profile": "/wellness-api/rest/user/settings",
+    }
+
+    if name not in endpoint_map:
         return [TextContent(type="text", text='{"error": "Herramienta no encontrada"}')]
 
-    try:
-        date_start = int(arguments.get("date_start_epoch"))
-    except (TypeError, ValueError):
-        return [TextContent(type="text", text='{"error": "date_start_epoch inválido"}')]
-
-    url = "https://apis.garmin.com/wellness-api/rest/dailies"
-    params = {"uploadStartTimeInSeconds": date_start}
-    headers = {"Authorization": f"Bearer {garmin_key}"}
+    url = f"{GARMIN_API_BASE}{endpoint_map[name]}"
+    
+    # Mapeo de parámetros específicos según la herramienta
+    params = {}
+    if name == "list_activities":
+        params = {"startDate": arguments.get("start_date"), "endDate": arguments.get("end_date")}
+    elif name == "get_garmin_health_summary":
+        try:
+            params = {"uploadStartTimeInSeconds": int(arguments.get("date_start_epoch"))}
+        except (TypeError, ValueError):
+            return [TextContent(type="text", text='{"error": "date_start_epoch inválido"}')]
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -135,13 +199,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 session_manager = StreamableHTTPSessionManager(
     app=mcp_server,
-    json_response=True,  # respuestas JSON simples, ideales detrás de Apache
-    stateless=True,      # sin sesiones: cada POST es independiente
+    json_response=True,
+    stateless=True,
 )
 
 
 # --------------------------------------------------------------------------
-# FastAPI (UI de registro) + ciclo de vida del session manager
+# FastAPI (UI de registro) + Ciclo de vida
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -217,8 +281,7 @@ async def register(
 
 
 # --------------------------------------------------------------------------
-# Gateway ASGI: enruta /garmin_mcp/<token>/(mcp|sse) al session manager
-# y deja todo lo demás a FastAPI (incluido el lifespan)
+# Gateway ASGI
 # --------------------------------------------------------------------------
 async def _send_json(send, status: int, body: dict) -> None:
     payload = json.dumps(body).encode()
@@ -249,8 +312,6 @@ class MCPGateway:
                     await _send_json(send, 401, {"error": "Token inválido"})
                     return
 
-                # El ContextVar se hereda por las tareas que crea el session
-                # manager dentro de handle_request, así las tools ven la key.
                 ctx_token = garmin_key_ctx.set(garmin_key)
                 try:
                     await session_manager.handle_request(scope, receive, send)
@@ -264,7 +325,7 @@ class MCPGateway:
 final_app = CORSMiddleware(
     app=MCPGateway(app),
     allow_origins=["*"],
-    allow_credentials=False,  # con origen "*" no se pueden usar credenciales
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Mcp-Session-Id"],
