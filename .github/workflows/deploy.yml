@@ -23,5 +23,8 @@ jobs:
 
       - name: Deploy files and restart service
         run: |
-          rsync -avz --exclude='.git' ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/root/garmin_mcp/
-          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "cd /root/garmin_mcp && pip install -r requirements.txt && systemctl restart garmin_mcp"
+          # Usamos -e 'ssh -p TU_PUERTO' para rsync
+          rsync -avz -e 'ssh -p ${{ secrets.SSH_PORT }}' --exclude='.git' ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/root/garmin_mcp/
+              
+          # Conectamos por SSH especificando el puerto -p
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "cd /root/garmin_mcp && pip install -r requirements.txt && systemctl restart garmin_mcp"          
