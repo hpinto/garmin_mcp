@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -80,18 +81,17 @@ init_db()
 async def get_valid_garmin_token(personal_api_key: str) -> str | None:
     """Intercambia la Personal API Key (GCDC_...) por el JWT Bearer Token."""
     headers = {
-        "Authorization": f"ApiKey {personal_api_key}",
-        "Accept": "application/json"
+        "Authorization": f"ApiKey {personal_api_key}"
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.post(TOKEN_URL, headers=headers)
             response.raise_for_status()
-            # Garmin devuelve el JWT directamente como texto plano
-            token = response.text.strip()
+            token = response.text.strip().strip('"')
             return token if token else None
         except Exception as e:
             return None
+
 
 # --------------------------------------------------------------------------
 # Servidor MCP y Definición de Herramientas
@@ -166,7 +166,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_user_profile",
-            description="Obtiene las configuraciones y perfil general del usuario (UserSettingsDTO).",
+            description="Obtiene las configuraciones y perfil general del usuario.",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
@@ -178,21 +178,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not personal_api_key:
         return [TextContent(type="text", text='{"error": "Usuario no identificado"}')]
 
-    # 1. Obtener automáticamente el Bearer token válido usando la API Key del usuario
     access_token = await get_valid_garmin_token(personal_api_key)
     if not access_token:
         return [TextContent(type="text", text='{"error": "No se pudo autenticar con Garmin. Verifica tu Personal API Key."}')]
 
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     
+    # Mapeo corregido a los microservicios oficiales de la Personal API de Garmin
     endpoint_map = {
-        "get_activity_summary": f"/wellness-api/rest/activities/{arguments.get('activity_id')}",
-        "list_activities": "/wellness-api/rest/activities",
-        "get_garmin_health_summary": "/wellness-api/rest/dailies",
-        "get_sleep_summary": f"/wellness-api/rest/sleeps/{arguments.get('calendar_date')}",
-        "get_hrv_summary": f"/wellness-api/rest/hrv/{arguments.get('calendar_date')}",
-        "get_body_battery": f"/wellness-api/rest/bodyBattery/{arguments.get('calendar_date')}",
-        "get_user_profile": "/wellness-api/rest/user/settings",
+        "get_activity_summary": f"/activity-service/activity/{arguments.get('activity_id')}",
+        "list_activities": "/activitylist-service/activities/search/activities",
+        "get_garmin_health_summary": "/usersummary-service/v2/dailysummaries",
+        "get_sleep_summary": "/sleep-service/sleep/dailySleep",
+        "get_hrv_summary": f"/hrv-service/hrv/{arguments.get('calendar_date')}",
+        "get_body_battery": "/wellness-service/wellness/bodyBattery/reports/daily",
+        "get_user_profile": "/userprofile-service/userprofile/settings",
     }
 
     if name not in endpoint_map:
@@ -202,17 +202,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     
     params = {}
     if name == "list_activities":
-        params = {"startDate": arguments.get("start_date"), "endDate": arguments.get("end_date")}
+        params = {
+            "startDate": arguments.get("start_date"),
+            "endDate": arguments.get("end_date")
+        }
     elif name == "get_garmin_health_summary":
         try:
-            params = {"uploadStartTimeInSeconds": int(arguments.get("date_start_epoch"))}
+            epoch = int(arguments.get("date_start_epoch"))
+            dt_str = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime('%Y-%m-%d')
+            params = {"startDate": dt_str, "endDate": dt_str}
         except (TypeError, ValueError):
             return [TextContent(type="text", text='{"error": "date_start_epoch inválido"}')]
+    elif name == "get_sleep_summary":
+        params = {"date": arguments.get("calendar_date")}
+    elif name == "get_body_battery":
+        cal_date = arguments.get("calendar_date")
+        params = {"startDate": cal_date, "endDate": cal_date}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             resp = await client.get(url, params=params, headers=headers)
-            resp.raise_for_status()
+            
+            if resp.is_error:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": f"Garmin API Error {resp.status_code}",
+                    "url_requested": str(resp.url),
+                    "garmin_response": resp.text
+                }, indent=2))]
+                
             return [TextContent(type="text", text=json.dumps(resp.json(), indent=2))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
